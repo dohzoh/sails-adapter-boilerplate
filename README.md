@@ -11,10 +11,9 @@ Install is through NPM.
 
 ```bash
 $ sails new project && cd project
-$ npm install git://github.com/dohzoh/sails-dynamodb.git
-$ cp node_modules/sails-dynamodb/credentials.example.json ./credentials.json  # & put your amazon keys
+$ npm install sails-dynamodb --save
 ```
-Todo: to npm package
+Add your amazon keys to your adapter config
 
 
 ## Configuration
@@ -32,7 +31,11 @@ module.exports.adapters = {
   },
   
   dynamoDb: {
-    adapter: "sails-dynamodb"
+    adapter: "sails-dynamodb",
+    accessKeyId: process.env.DYNAMO_ACCESS_KEY_ID,
+    secretAccessKey: process.env.DYNAMO_SECRET_ACCESS_KEY,
+    region: "us-west-1",
+    endPoint: "http://localhost:8000", // Optional: add for DynamoDB local
   },
   
 };
@@ -48,6 +51,160 @@ module.exports.adapters = {
   
 };
 ```
+
+## Find
+Support for where is added as following:
+```
+  ?where={"name":{"null":true}}
+  ?where={"name":{"notNull":true}}
+  ?where={"name":{"equals":"firstName lastName"}}
+  ?where={"name":{"ne":"firstName lastName"}}
+  ?where={"name":{"lte":"firstName lastName"}}
+  ?where={"name":{"lt":"firstName lastName"}}
+  ?where={"name":{"gte":"firstName lastName"}}
+  ?where={"name":{"gt":"firstName lastName"}}
+  ?where={"name":{"contains":"firstName lastName"}}
+  ?where={"name":{"contains":"firstName lastName"}}
+  ?where={"name":{"beginsWith":"firstName"}}
+  ?where={"name":{"in":["firstName lastName", "another name"]}}
+  ?where={"name":{"between":["firstName", "lastName"]}}
+```
+You can specify what attributes/keys should be returned from the query as following:
+```
+  //This will return only name and age in the result (if the field exists in the result)
+  ?where={"name":{"equals":"firstName lastName"}, "select": ["name","age"]}
+```
+
+### Pagination
+__NOTE__: `skip` is not supported!
+
+Support for Pagination is done using DynamoDB's `LastEvaluatedKey` and passing that to `ExclusiveStartKey`.
+See: [DynamoDB Documentation](http://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Query.html)
+
+1. First add a limit to current request
+
+```
+/user?limit=2
+```
+    
+2. Then get the last primaryKey value and send it as startKey in the next request
+
+```
+/user?limit=2&startKey={"PrimaryKey": "2"}
+```
+
+For more complex queries, you must provide all the fields that are used for an index of the last object returned. An example not using the blueprint apis below. Assume there is a GSI on email (hash) and loginDate (range).
+
+```
+// Looking for recent logins by a specific email address
+UserLogins.find({
+  where: {
+    email: 'someone@like.you'
+    loginDate: {"lt": new Date().toISOString()}
+  },
+  limit: 10
+}).exec((err, userLogins) => {
+  UserLogins.find({
+    where: {
+      email: 'someone@like.you'
+      loginDate: {"lt": new Date().toISOString()},
+      startKey: {
+        email: 'someone@like.you',
+        loginDate: userLogins[userLogins.length - 1].loginDate
+      }
+    },
+    limit: 10
+  }).exec((err, moreUserLogins) => {
+    doSomethingWithLogins(userLogins.concat(moreUserLogins));
+  });
+});
+```
+
+See that the startKey is in the `where` block and that it has both fields of the Global Secondary Index.
+
+## Using DynamoDB Indexes
+Primary hash/range keys, local secondary indexes, and global secondary indexes are currently supported by this adapter, but their usage is always inferred from query conditions–`Model.find` will attempt to use the most optimal index using the following precedence:
+```
+Primary hash and range > primary hash and secondary range > global secondary hash and range
+> primary hash > global secondary hash > no index/primary
+```
+If an index is being used and there are additional query conditions, then results are compiled using DynamoDB's result filtering.  If no index can be used for a query, then the adapter will perform a scan on the table for results.
+
+### Adding Indexes
+#### Primary hash and primary range
+```
+UserId: {
+  type: 'integer',
+  primaryKey: 'hash'
+},
+GameTitle: {
+  type: 'string',
+  primaryKey: 'range'
+}
+```
+#### Secondary range (local secondary index)
+The index name used for a local secondary index is the name of the field suffixed by "Index".  In this case the index name is `TimeIndex`.
+```
+Time: {
+  type: 'datetime',
+  index: 'secondary'
+}
+```
+#### Global secondary index
+The index name used for a global secondary index is specified in the `index` property before the type of key (`hash` or `range`).  In this case the index name is `GameTitleIndex`.
+```
+GameTitle: {
+  type: 'string',
+  index: 'GameTitleIndex-hash'
+},
+HighScore: {
+  type: 'integer',
+  index: 'GameTitleIndex-range'
+}
+```
+
+#### Fields with multiple indexes
+A field can be both the primary and part of a GSI index. Participating in multiple GSI indexes is supported as of v0.12.5.
+
+```
+GameTitle: {
+  type: 'string',
+  primaryKey: 'hash'
+  index: 'GameTitleIndex-hash'
+}
+```
+
+Multiple GSIs:
+```
+GameTitle: {
+  type: 'string',
+  primaryKey: 'hash'
+  index: ['GameTitleIndex-hash', 'SomeOtherIndex-hash']
+}
+```
+
+Multiple GSIs and a secondary index:
+```
+GameTitle: {
+  type: 'string',
+  primaryKey: 'hash'
+  index: ['secondary', 'GameTitleIndex-hash', 'SomeOtherIndex-hash']
+}
+```
+
+### Sorting By Indexes
+Sorting does not look like how it looks with the normal sails database adapters. You can not sort by an arbitrary field, you must sort by a range field in an index. The index is automatically inferred by what you are querying and you can specify a direction to sort the range fields of the used index. Using the GSI defined above, this will query for descending highscores of Super Mario World:
+```
+GameScores.find({
+  where: {
+    GameTitle: "Super Mario World"
+  },
+  sort: "-1"
+})
+```
+
+## Update
+The `Model.update` method is currently expected to update exactly one item since DynamoDB only offers an [UpdateItem](http://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateItem.html) endpoint.  A complete primary key must be supplied.  Any additional "where" conditions passed to `Model.update` are used to build a conditional expression for the update.  Despite the fact the DynamoDB updates only one item, `Model.update` will always return an array of the (one or zero) updated items upon success.
 
 ## Testing
 
